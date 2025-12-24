@@ -1,33 +1,29 @@
 
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, Type } from "@google/genai";
 import { ContractAnalysis, NegotiationStage } from "../types";
 
+// Helper to sanitize JSON response from the model
+const parseJsonResponse = (text: string) => {
+  try {
+    const cleanText = text.replace(/```json|```/g, "").trim();
+    return JSON.parse(cleanText);
+  } catch (e) {
+    console.error("Failed to parse JSON response:", text);
+    throw new Error("Resposta do modelo em formato inválido.");
+  }
+};
+
 export const analyzeContract = async (base64File: string, mimeType: string): Promise<ContractAnalysis> => {
-  // Inicialização dinâmica para garantir que use a chave mais atual (injetada ou selecionada pelo usuário)
+  // Create a new instance right before the call to use the most up-to-date API key
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   
   const prompt = `Analise este contrato de financiamento brasileiro. 
-  Identifique: taxa de juros, irregularidades comuns (TAC, anatocismo, venda casada), 
-  referências ao Código de Defesa do Consumidor (CDC) e calcule a economia potencial se a taxa for reduzida para a média de mercado (considere média de 1.8% a.m.).
-  
-  Retorne um objeto JSON seguindo estritamente este formato:
-  {
-    "status": "fair" | "irregular" | "critical",
-    "interestRate": número (porcentagem mensal),
-    "averageMarketRate": 1.8,
-    "irregularities": [
-      { "title": string, "description": string, "legalReference": string, "impact": "low" | "medium" | "high" }
-    ],
-    "estimatedMonthlySavings": número,
-    "totalPotentialSavings": número,
-    "installmentsRemaining": número,
-    "currentInstallmentValue": número,
-    "legalArguments": [string]
-  }`;
+  Identifique: taxa de juros mensal, irregularidades comuns (TAC, anatocismo, venda casada), 
+  referências ao Código de Defesa do Consumidor (CDC) e calcule a economia potencial se a taxa for reduzida para a média de mercado (considere média de 1.8% a.m.).`;
 
   try {
     const response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview",
+      model: "gemini-3-pro-preview", // Complex reasoning task
       contents: {
         parts: [
           { inlineData: { data: base64File, mimeType: mimeType } },
@@ -36,20 +32,57 @@ export const analyzeContract = async (base64File: string, mimeType: string): Pro
       },
       config: {
         responseMimeType: "application/json",
+        // Using responseSchema as recommended for reliable JSON output
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            status: { type: Type.STRING, description: "Status do contrato: fair, irregular ou critical" },
+            interestRate: { type: Type.NUMBER, description: "Taxa de juros mensal encontrada" },
+            averageMarketRate: { type: Type.NUMBER, description: "Taxa média de mercado (ex: 1.8)" },
+            irregularities: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  title: { type: Type.STRING },
+                  description: { type: Type.STRING },
+                  legalReference: { type: Type.STRING },
+                  impact: { type: Type.STRING }
+                },
+                required: ['title', 'description', 'legalReference', 'impact']
+              }
+            },
+            estimatedMonthlySavings: { type: Type.NUMBER },
+            totalPotentialSavings: { type: Type.NUMBER },
+            installmentsRemaining: { type: Type.NUMBER },
+            currentInstallmentValue: { type: Type.NUMBER },
+            legalArguments: { type: Type.ARRAY, items: { type: Type.STRING } }
+          },
+          required: [
+            'status', 'interestRate', 'averageMarketRate', 'irregularities', 
+            'estimatedMonthlySavings', 'totalPotentialSavings', 
+            'installmentsRemaining', 'currentInstallmentValue', 'legalArguments'
+          ]
+        },
+        thinkingConfig: { thinkingBudget: 4000 } // Adding reasoning budget for contract analysis
       }
     });
 
-    const data = JSON.parse(response.text || "{}");
-    return data as ContractAnalysis;
+    return parseJsonResponse(response.text || "{}") as ContractAnalysis;
   } catch (error: any) {
     console.error("Erro na análise do contrato:", error);
     
-    // Verifica erro específico de chave/entidade não encontrada para resetar estado se necessário
-    if (error.message?.includes("Requested entity was not found") || error.message?.includes("API key")) {
+    // Handle specific API errors as per guidelines
+    if (
+      error.message?.includes("Requested entity was not found") || 
+      error.message?.includes("API key") || 
+      error.message?.includes("401") ||
+      error.message?.includes("403")
+    ) {
       throw new Error("KEY_ERROR");
     }
     
-    throw new Error("Falha técnica ao processar o contrato. Verifique o arquivo e tente novamente.");
+    throw new Error(error.message || "Falha ao processar o contrato. Tente novamente em instantes.");
   }
 };
 
@@ -59,28 +92,32 @@ export const generateNegotiationDocument = async (analysis: ContractAnalysis, st
   let contextPrompt = "";
   
   if (stage === 'sac') {
-    contextPrompt = "Escreva uma solicitação formal para o SAC (Serviço de Atendimento ao Consumidor) do banco. O tom deve ser profissional, direto e amigável, solicitando a revisão da taxa de juros e exclusão de taxas indevidas.";
+    contextPrompt = "Escreva uma solicitação formal para o SAC de um banco. Solicite a revisão da taxa de juros e exclusão de taxas indevidas identificadas no contrato.";
   } else if (stage === 'reclame-aqui') {
-    contextPrompt = "Escreva uma reclamação para o site Reclame Aqui. Use o argumento central: dificuldade de contato com canais oficiais para solicitar a revisão das condições do contrato (Nº XXXXX) e o acesso ao Extrato de Evolução da Dívida. Mencione dificuldades técnicas e demora no atendimento. Solicite uma análise da taxa de juros frente à média de mercado e o envio imediato da planilha de débitos. O tom deve ser de indignação moderada mas tecnicamente fundamentada no CDC.";
+    contextPrompt = "Escreva uma reclamação para o Reclame Aqui. Argumento: Dificuldade de acesso ao SAC e falta de transparência nas taxas. Exija a revisão baseada no CDC.";
   } else if (stage === 'consumidor-gov') {
-    contextPrompt = "Escreva uma petição administrativa para o portal Consumidor.gov.br (monitorado pela SENACON e Banco Central). O tom deve ser técnico e jurídico, citando especificamente as leis nacionais, as súmulas do STJ mencionadas e exigindo a readequação do contrato sob pena de fiscalização pelo BACEN.";
+    contextPrompt = "Escreva uma petição técnica para o Consumidor.gov.br. Cite as abusividades encontradas e exija a readequação do contrato à taxa média do Banco Central.";
   }
 
   const prompt = `${contextPrompt}
   Dados do Contrato:
   - Irregularidades: ${analysis.irregularities.map(i => i.title).join(", ")}
-  - Taxa Atual: ${analysis.interestRate}% (Média Mercado: ${analysis.averageMarketRate}%)
-  - Valor da Parcela: R$ ${analysis.currentInstallmentValue}
-  - Argumentos Legais: ${analysis.legalArguments.join("; ")}`;
+  - Taxa Atual: ${analysis.interestRate}%
+  - Parcela Atual: R$ ${analysis.currentInstallmentValue}
+  - Economia Projetada na Parcela: R$ ${analysis.estimatedMonthlySavings}
+  - Base Legal: ${analysis.legalArguments.join("; ")}`;
 
   try {
     const response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview",
-      contents: prompt
+      model: "gemini-3-pro-preview",
+      contents: prompt,
+      config: {
+        thinkingConfig: { thinkingBudget: 2000 }
+      }
     });
-    return response.text || "";
+    return response.text || "Erro ao gerar documento.";
   } catch (error: any) {
-    if (error.message?.includes("Requested entity was not found")) {
+    if (error.message?.includes("Requested entity was not found") || error.message?.includes("401") || error.message?.includes("403")) {
       throw new Error("KEY_ERROR");
     }
     throw error;
