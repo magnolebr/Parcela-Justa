@@ -1,0 +1,7 @@
+{
+  "name": "Parcela Justa - Veículos",
+  "description": "Auditoria técnica especializada para identificação de juros abusivos e irregularidades em contratos de financiamento automotivo.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
